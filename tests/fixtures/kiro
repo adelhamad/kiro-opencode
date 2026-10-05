@@ -1,0 +1,26 @@
+#!/usr/bin/env bun
+export {};
+let url = ''; let sequence = 0;
+const send = (value: any) => process.stdout.write(JSON.stringify(value) + '\n');
+async function handle(msg: any) {
+  if (msg.method === 'initialize') send({ id: msg.id, result: { protocolVersion: 1 } });
+  if (msg.method === 'session/new') { url = msg.params.mcpServers[0].args[1]; send({ id: msg.id, result: { sessionId: 'fake' } }); }
+  if (msg.method === 'session/set_model') send({ id: msg.id, result: {} });
+  if (msg.method === 'session/prompt') {
+    const prompt = msg.params.prompt[0].text;
+    if (prompt.includes('TOOL')) {
+      const invoke = () => fetch(url, { method: 'POST', body: JSON.stringify({ jsonrpc: '2.0', id: ++sequence, method: 'tools/call', params: { name: 'write', arguments: { path: 'test.txt', content: 'HELLO' } } }) }).then(r => r.json());
+      const result = prompt.includes('PARALLEL') ? await Promise.all([invoke(), invoke()]) : await invoke();
+      send({ method: 'session/update', params: { sessionId: 'fake', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: JSON.stringify(result) } } } });
+    } else {
+      send({ method: 'session/update', params: { sessionId: 'fake', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'FAKE_OK' } } } });
+    }
+    send({ id: msg.id, result: { stopReason: 'end_turn' } });
+  }
+}
+let buffer = '';
+for await (const data of Bun.stdin.stream()) {
+  buffer += new TextDecoder().decode(data);
+  let end: number;
+  while ((end = buffer.indexOf('\n')) >= 0) { const line = buffer.slice(0, end); buffer = buffer.slice(end + 1); if (line) void handle(JSON.parse(line)); }
+}

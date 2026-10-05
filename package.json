@@ -1,0 +1,37 @@
+{
+  "name": "opencode-kiro",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "install:plugin": "bun scripts/install.ts",
+    "uninstall:plugin": "bun scripts/install.ts --uninstall",
+    "test:e2e": "bun scripts/e2e.ts",
+    "test:package": "bun scripts/package-smoke.ts",
+    "build:release": "bun scripts/build-release.ts",
+    "test:install": "bun scripts/install-smoke.ts"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.0.23",
+    "gpt-tokenizer": "^4.0.0",
+    "jsonc-parser": "^3.3.1"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "typescript": "^7.0.2"
+  },
+  "version": "0.2.1",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "files": [
+    "index.ts",
+    "src",
+    "scripts/install.ts",
+    "bun.lock",
+    "README.md",
+    "VERIFICATION.md"
+  ],
+  "description": "Kiro CLI model provider with OpenCode v2 native tool and permission integration"
+}

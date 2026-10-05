@@ -1,0 +1,6 @@
+node_modules/
+.env
+sandbox/
+.e2e/
+*.tgz
+dist/
