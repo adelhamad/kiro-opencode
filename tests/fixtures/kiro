@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 export {};
+if (process.argv[2] === 'whoami') { console.log('{}'); process.exit(0); }
 let url = ''; let sequence = 0;
 const send = (value: any) => process.stdout.write(JSON.stringify(value) + '\n');
 async function handle(msg: any) {

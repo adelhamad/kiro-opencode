@@ -1,0 +1,34 @@
+#!/usr/bin/env bun
+import { appendFileSync } from 'node:fs';
+const state = await Bun.file(import.meta.path + '.json').json();
+appendFileSync(import.meta.path + '.calls', JSON.stringify(process.argv.slice(2)) + '\n');
+const command = process.argv[2];
+if (state.forkHang) { Bun.spawn([process.execPath, '-e', 'setInterval(() => {}, 1000)'], { stdout: 'inherit', stderr: 'inherit' }); }
+if (state.hang || state.forkHang) { process.on('SIGTERM', () => {}); setInterval(() => {}, 1000); await new Promise(() => {}); }
+if (command === 'whoami') {
+  if (!state.loggedIn) { console.error(state.unauthorized ? 'Unauthorized' : 'Not logged in https://example.invalid/?token=SECRET'); process.exit(1); }
+  console.log('{}'); process.exit(0);
+}
+if (command === 'chat') {
+  if (!process.argv.includes('--no-interactive')) { console.error('Interactive discovery is forbidden'); process.exit(2); }
+  if (state.listFailure) { console.error('Authentication expired https://example.invalid/?token=SECRET'); process.exit(1); }
+  if (state.noisy) process.stderr.write('x'.repeat(256 * 1024));
+  console.log(JSON.stringify({ models: [{ model_id: 'test-model', model_name: 'Test model' }] })); process.exit(0);
+}
+if (state.acpFailure) { console.error('Authentication expired https://example.invalid/?token=SECRET'); process.exit(1); }
+let buffer = '';
+for await (const bytes of Bun.stdin.stream()) {
+  buffer += new TextDecoder().decode(bytes);
+  let end;
+  while ((end = buffer.indexOf('\n')) >= 0) {
+    const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
+    if (!line) continue;
+    const msg = JSON.parse(line);
+    const send = (value: unknown) => console.log(JSON.stringify(value));
+    if (msg.method === 'session/prompt') {
+      if (state.promptFailure) { send({ id: msg.id, error: { message: 'Authentication expired', data: { token: 'SECRET' } } }); continue; }
+      send({ method: 'session/update', params: { update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'RECOVERED' } } } });
+    }
+    send({ id: msg.id, result: msg.method === 'session/new' ? { sessionId: 'test' } : msg.method === 'session/prompt' ? { stopReason: 'end_turn' } : {} });
+  }
+}
