@@ -72,7 +72,8 @@ opencode run --standalone --model kiro/claude-sonnet-4.6 "Reply with HELLO. Do n
 
 - **Kiro is missing from `/models`:** run `opencode service restart`, allow it to initialize, then check `opencode plugin list` and `opencode models`. Restart the terminal UI afterward. The plugin ID should be `opencode.provider.kiro`.
 - **The plugin fails to load:** confirm `bun` and `kiro-cli` are on OpenCode's `PATH`, the installed directory still exists, and dependency installation completed. Re-run the installation command if necessary.
-- **Authentication or unavailable-model errors:** run `kiro-cli login` and `kiro-cli chat --list-models --format json`. Select an explicit model from that list, then restart the service.
+- **Authentication expired:** leave OpenCode open and run `kiro-cli login --use-device-flow` in a separate terminal. Complete sign-in there, then retry the failed request. Device flow avoids a localhost browser callback. The plugin checks authentication before starting Kiro, uses non-interactive model discovery, and refreshes the model list every 30 seconds; a failed check no longer prevents plugin startup. If you started while signed out, allow the next refresh for Kiro models to appear.
+- **Unavailable-model errors:** run `kiro-cli chat --list-models --format json` and select an available model. CLI check failures and timeouts are reported separately; check the command in a terminal for detailed diagnostics.
 - **Duplicate plugin ID:** keep one installation. Remove any separate project or global copy that registers another clone of this plugin.
 - **The model calls itself Kiro:** this integration uses Kiro's agent through ACP. Its built-in instructions remain; this is not a raw Claude API connection. A custom agent prompt does not remove that underlying agent layer.
 
@@ -155,7 +156,7 @@ See [VERIFICATION.md](VERIFICATION.md) for the actual live checks. No compatibil
 - Binary PDF/audio/video input is not supported by the CLI bridge. Images are supported; text files use OpenCode's normal resolution/read tools. Unsupported content fails explicitly.
 - Kiro's own proprietary agents, native subagents and global MCP settings are not injected into OpenCode. OpenCode's available tools are the execution surface.
 - Chat sampling, stop sequences, output limits and structured-output controls are not equivalent to a raw model API over ACP. This is an OpenCode provider integration, not a general-purpose OpenAI API implementation or a Codex Responses provider.
-- Pending tool continuations expire after five minutes; a complete generation has a fifteen-minute ACP deadline. Restart OpenCode after an authentication change or CLI upgrade.
+- Pending tool continuations expire after five minutes; a complete generation has a fifteen-minute ACP deadline. Retry the failed request after an authentication change; interrupted generations are not replayed automatically. Restart OpenCode after a CLI upgrade.
 
 ## Development
 
@@ -163,10 +164,11 @@ See [VERIFICATION.md](VERIFICATION.md) for the actual live checks. No compatibil
 bun run typecheck
 bun test
 bun run test:e2e
+bun run test:auth
 bun run test:package
 bun run test:install
 ```
 
-The E2E suite uses your logged-in Kiro account and consumes model credits. It creates its own disposable Git workspace and private OpenCode server, then removes both; it does not change global configuration. Unit tests use a fake CLI. Installation tests verify comment preservation, idempotency and isolated uninstall. `test:install` builds the release archive and exercises the shell installer with a local download fixture, production dependencies, upgrade migration and uninstall in an isolated configuration.
+The E2E suite uses your logged-in Kiro account and consumes model credits. It creates its own disposable Git workspace and private OpenCode server, then removes both; it does not change global configuration. Unit tests use a fake CLI. `test:auth` runs a real isolated OpenCode server with simulated Kiro login expiry and recovery, without using account credentials or model credits. Installation tests verify comment preservation, idempotency and isolated uninstall. `test:install` builds the release archive and exercises the shell installer with a local download fixture, production dependencies, upgrade migration and uninstall in an isolated configuration.
 
 References: [OpenCode v2 plugins](https://opencode.ai/v2/docs/build/plugins), [providers](https://opencode.ai/v2/docs/providers).

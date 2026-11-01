@@ -1,4 +1,5 @@
 import { AcpClient } from './acp';
+import { isAuthError } from './auth';
 import { promptBlocks, toolResult } from './prompt';
 import { estimatedUsage } from './usage';
 import { fileURLToPath } from 'node:url';
@@ -82,9 +83,18 @@ export async function createBridge(directory: string, options: { cli?: string; m
           if (content?.type === 'text' && update.sessionUpdate === 'agent_message_chunk') active.queue.push({ type: 'text', text: content.text });
           if (content?.type === 'text' && update.sessionUpdate === 'agent_thought_chunk') active.queue.push({ type: 'reasoning', text: content.text });
         };
+        const abortStartup = () => { void stopTurn(active); };
+        request.signal.addEventListener('abort', abortStartup, { once: true });
+        try {
+          if (request.signal.aborted) await stopTurn(active);
+          await active.client.start(options.cli, typeof body.reasoning_effort === 'string' ? body.reasoning_effort : undefined);
+        } catch (error) {
+          await stopTurn(active);
+          const message = String(error);
+          return Response.json({ error: { message, type: isAuthError(message) ? 'authentication_error' : 'kiro_error' } }, { status: isAuthError(message) ? 401 : 502, headers: { 'x-should-retry': 'false' } });
+        } finally { request.signal.removeEventListener('abort', abortStartup); }
         void (async () => {
           try {
-            await active.client.start(options.cli, typeof body.reasoning_effort === 'string' ? body.reasoning_effort : undefined);
             const session = await active.client.call('session/new', { cwd: request.headers.get('x-opencode-directory') || directory, mcpServers: [{ name: 'opencode', command: Bun.which('bun') || 'bun', args: [fileURLToPath(new URL('./mcp.ts', import.meta.url)), `${server.url}mcp/${active.token}`], env: [] }] });
             active.sessionId = session.sessionId;
             await active.client.call('session/set_model', { sessionId: active.sessionId, modelId: body.model === 'auto' ? (options.model || 'claude-sonnet-4.6') : body.model });
@@ -120,7 +130,7 @@ export async function createBridge(directory: string, options: { cli?: string; m
                 emit(chunk({ tool_calls: [{ index: 0, id: event.id, type: 'function', function: { name: event.name, arguments: JSON.stringify(event.args) } }] }));
                 emit(chunk({}, 'tool_calls')); emit(usageChunk()); emit('[DONE]'); break;
               } else if (event.type === 'done') { emit(chunk({}, 'stop')); emit(usageChunk()); emit('[DONE]'); break; }
-              else if (event.type === 'error') { emit({ error: { message: event.message, type: 'kiro_error' } }); emit('[DONE]'); break; }
+              else if (event.type === 'error') { emit({ error: { message: event.message, type: isAuthError(event.message) ? 'authentication_error' : 'kiro_error', ...(isAuthError(event.message) ? { code: 401 } : {}) } }); emit('[DONE]'); break; }
             }
           })().finally(() => {
             clearInterval(heartbeat); request.signal.removeEventListener('abort', abort);

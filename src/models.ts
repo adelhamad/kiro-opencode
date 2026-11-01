@@ -1,12 +1,45 @@
+import { checkAuthentication, runCli } from './auth';
+
 export interface KiroModel { model_id: string; model_name: string; context_window_tokens?: number; description?: string }
-export async function discoverModels(cli = 'kiro-cli'): Promise<KiroModel[]> {
-  const child = Bun.spawn([cli, 'chat', '--list-models', '--format', 'json'], { stdout: 'pipe', stderr: 'pipe' });
-  const timer = setTimeout(() => child.kill(), 15_000);
-  try {
-    const output = await new Response(child.stdout).text();
-    if (await child.exited !== 0) throw new Error('Cannot read Kiro model list. Check kiro-cli login.');
-    const data = JSON.parse(output);
-    if (!Array.isArray(data.models) || !data.models.length) throw new Error('Kiro returned an empty model list');
-    return data.models;
-  } finally { clearTimeout(timer); }
+export async function discoverModels(cli = 'kiro-cli', signal?: AbortSignal): Promise<KiroModel[]> {
+  await checkAuthentication(cli, signal);
+  const output = await runCli(cli, ['chat', '--no-interactive', '--list-models', '--format', 'json'], signal);
+  let data;
+  try { data = JSON.parse(output); } catch { throw new Error('Kiro returned invalid model JSON'); }
+  if (!Array.isArray(data.models) || !data.models.length || data.models.some((model: KiroModel) =>
+    !model || typeof model.model_id !== 'string' || !model.model_id || typeof model.model_name !== 'string')) {
+    throw new Error('Kiro returned an empty or invalid model list');
+  }
+  return data.models;
+}
+
+// A failed discovery must not reject plugin setup. Retry serially and cancel on unload.
+export function watchModels(options: {
+  cli: string; signal: AbortSignal; interval?: number;
+  update(models: KiroModel[]): Promise<void>;
+  report(message: string): void;
+}) {
+  return (async () => {
+    let previous = '';
+    let lastError = '';
+    while (!options.signal.aborted) {
+      try {
+        const models = await discoverModels(options.cli, options.signal);
+        const current = JSON.stringify(models);
+        if (current !== previous) { await options.update(models); previous = current; }
+        lastError = '';
+      } catch (error) {
+        if (options.signal.aborted) return;
+        const message = String(error);
+        if (message !== lastError) options.report(message);
+        lastError = message;
+      }
+      if (options.signal.aborted) return;
+      await new Promise<void>(resolve => {
+        const finish = () => { clearTimeout(timer); options.signal.removeEventListener('abort', finish); resolve(); };
+        const timer = setTimeout(finish, options.interval ?? 30_000);
+        options.signal.addEventListener('abort', finish, { once: true });
+      });
+    }
+  })();
 }

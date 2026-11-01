@@ -10,7 +10,8 @@
     "test:e2e": "bun scripts/e2e.ts",
     "test:package": "bun scripts/package-smoke.ts",
     "build:release": "bun scripts/build-release.ts",
-    "test:install": "bun scripts/install-smoke.ts"
+    "test:install": "bun scripts/install-smoke.ts",
+    "test:auth": "bun scripts/auth-e2e.ts"
   },
   "dependencies": {
     "@opencode/plugin": "2.0.23",
