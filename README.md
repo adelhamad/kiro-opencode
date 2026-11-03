@@ -131,12 +131,16 @@ For explicit CLI location or the `auto` fallback, replace the plugin entry with 
       "package": "/absolute/path/to/kiro-opencode",
       "options": {
         "cli": "/absolute/path/to/kiro-cli",
-        "model": "claude-sonnet-4.6"
+        "model": "claude-sonnet-4.6",
+        "prewarm": true,
+        "idleMinutes": 15
       }
     }
   ]
 }
 ```
+
+`prewarm` (default `true`) starts the Kiro process when the plugin loads with a signed-in CLI, so the first message skips process startup; set it to `false` to start Kiro only on the first request. `idleMinutes` (default 15) is how long an unused Kiro process and kept conversations stay alive.
 
 Select an explicit model when its identity matters. `auto` maps to the configured fallback (Sonnet 4.6 by default) rather than relying on a potentially unavailable CLI default. Low/medium/high reasoning variants are forwarded to Kiro's `--effort` flag; availability is determined by Kiro and the selected model.
 
@@ -144,15 +148,16 @@ Select an explicit model when its identity matters. `auto` maps to the configure
 
 Kiro receives an isolated temporary agent with **only** the relay MCP server's tools. It never gets built-in filesystem or shell tools, global Kiro MCP servers or user-defined Kiro agent hooks. The relay exposes the tool snapshot OpenCode supplied for that request. Every requested call is returned to OpenCode as a normal function call; OpenCode executes it with its own permission checks, and its result unblocks Kiro. Existing OpenCode plugins and MCP tools, including v2 Code Mode tools, follow that same path.
 
-The private bridge binds to loopback on an automatically assigned port, with a random in-memory API secret and separate unguessable MCP session URLs. Authentication stays inside the official CLI. Processes are lazy: selecting Kiro does not start a model generation until a request is made. Concurrent OpenCode sessions and auxiliary title/compaction requests use separate Kiro turns.
+The private bridge binds to loopback on an automatically assigned port, with a random in-memory API secret and separate unguessable MCP session URLs. Authentication stays inside the official CLI. One warm `kiro-cli acp` process per reasoning-effort level hosts all conversations as separate Kiro sessions; it exits after it has been idle, when OpenCode unloads the plugin or exits, and after an authentication failure. Prewarming starts the process but makes no model request and uses no credits. Concurrent OpenCode sessions and auxiliary title/compaction requests use separate Kiro sessions.
 
 ## Verified behavior and boundaries
 
 See [VERIFICATION.md](VERIFICATION.md) for the actual live checks. No compatibility layer can promise that future OpenCode/Kiro releases or every possible tool invocation will be issue-free.
 
 - Text and base64 image input, streamed text/reasoning, native tools, existing MCP tools, permissions, session history and compaction use the normal OpenCode path.
-- Each new user/auxiliary generation starts a fresh Kiro session with a labelled transcript of OpenCode's context. Tool-driven continuations within that generation resume the suspended Kiro turn. ACP has no separate native system-role field.
-- Kiro 2.x ACP does not expose exact billing token counts. OpenCode receives **estimated BPE text counts**, useful for context accounting but not exact Claude tokenization, image usage or Kiro credits. Cost is not fabricated.
+- An OpenCode conversation keeps its Kiro session between messages. A follow-up sends only the new user message; Kiro already holds the earlier turns, so they are not re-sent as new input and Kiro can reuse its prompt cache. The plugin compares digests of every earlier message. If anything before the new message changed (undo/revert, compaction, edited instructions, a different tool list, directory or effort level), after an interruption or error, or after the conversation idled out, it starts a fresh Kiro session with a labelled transcript of OpenCode's full context. Title and compaction requests are always one-shot sessions. Tool-driven continuations within a generation resume the suspended Kiro turn. ACP has no separate native system-role field.
+- Starting Kiro reuses the model watcher's recent `kiro-cli whoami` result instead of running it again for every message.
+- Kiro 2.x ACP does not expose exact billing token counts. OpenCode receives **estimated BPE text counts** of the full conversation, even when only a follow-up was sent, because OpenCode uses them for context accounting and compaction. They are not exact Claude tokenization, image usage or Kiro credits. Cost is not fabricated. Set `KIRO_OPENCODE_DEBUG=/path/to/log.jsonl` in OpenCode's environment to record per-request timings, whether the Kiro session was reused, and Kiro's reported credits (no message content).
 - Binary PDF/audio/video input is not supported by the CLI bridge. Images are supported; text files use OpenCode's normal resolution/read tools. Unsupported content fails explicitly.
 - Kiro's own proprietary agents, native subagents and global MCP settings are not injected into OpenCode. OpenCode's available tools are the execution surface.
 - Chat sampling, stop sequences, output limits and structured-output controls are not equivalent to a raw model API over ACP. This is an OpenCode provider integration, not a general-purpose OpenAI API implementation or a Codex Responses provider.

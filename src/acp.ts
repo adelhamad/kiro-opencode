@@ -47,7 +47,7 @@ export class AcpClient {
     void this.read();
     return this.call('initialize', { protocolVersion: 1, clientCapabilities: {
       fs: { readTextFile: false, writeTextFile: false }, terminal: false,
-    }, clientInfo: { name: 'opencode-kiro', version: '0.3.0' } }, 30_000);
+    }, clientInfo: { name: 'opencode-kiro', version: '0.2.0' } }, 30_000);
   }
   send(message: Rpc) { (this.child?.stdin as import('bun').FileSink | undefined)?.write(JSON.stringify(message) + '\n'); }
   notify(method: string, params: Rpc) { if (this.alive) this.send({ jsonrpc: '2.0', method, params }); }

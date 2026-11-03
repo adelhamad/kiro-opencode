@@ -18,7 +18,7 @@ class Queue {
 // so a follow-up message can be sent alone instead of replaying the transcript.
 interface Conversation {
   key: string; token: string; client: AcpClient; sessionId: string; effort: string; cwd: string; model?: string;
-  tools: Json[]; toolsDigest: string; history: string[]; seen: string[]; reusable: boolean; turn?: Turn;
+  tools: Json[]; toolsDigest: string; history: string[]; seen: string[]; reusable: boolean; turn?: Turn; used: number;
 }
 interface Turn {
   conversation: Conversation; queue: Queue; results: Map<string, (result: any) => void>;
@@ -38,9 +38,10 @@ export function followUp(history: string[], messages: Json[], hashes = messages.
   return rest;
 }
 
-export async function createBridge(directory: string, options: { cli?: string; model?: string; idleMs?: number } = {}) {
+export async function createBridge(directory: string, options: { cli?: string; model?: string; idleMs?: number; keep?: number } = {}) {
   const secret = crypto.randomUUID();
-  const pool = new AcpPool(options.cli, options.idleMs);
+  const idleMs = options.idleMs ?? 15 * 60_000;
+  const pool = new AcpPool(options.cli, idleMs);
   const conversations = new Map<string, Conversation>();
   const tokens = new Map<string, Conversation>();
   // Ending the Kiro session also stops its MCP relay process.
@@ -53,6 +54,14 @@ export async function createBridge(directory: string, options: { cli?: string; m
     conversation.client.terminate(conversation.sessionId);
     conversation.sessionId = '';
   };
+  // Each kept conversation holds a Kiro session and an MCP relay process, so
+  // keep only recent idle ones; an expired conversation restarts with the transcript.
+  const sweep = () => {
+    const idle = [...conversations.values()].filter(conversation => !conversation.turn).sort((a, b) => b.used - a.used);
+    idle.forEach((conversation, index) => { if (index >= (options.keep ?? 8) || performance.now() - conversation.used > idleMs) forget(conversation); });
+  };
+  const sweeper = setInterval(sweep, 60_000);
+  sweeper.unref?.();
   // Cancel only this Kiro session: the process is shared. A cancelled Kiro
   // session can answer later prompts with an immediate cancellation, so drop it.
   const stopTurn = async (turn: Turn) => {
@@ -80,7 +89,7 @@ export async function createBridge(directory: string, options: { cli?: string; m
         let msg: Json;
         try { msg = await request.json(); } catch { return Response.json({ error: 'Invalid JSON' }, { status: 400 }); }
         let result: any = {};
-        if (msg.method === 'initialize') result = { protocolVersion: msg.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: 'opencode', version: '0.3.0' } };
+        if (msg.method === 'initialize') result = { protocolVersion: msg.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: 'opencode', version: '0.2.0' } };
         else if (msg.method === 'tools/list') result = { tools: conversation.tools.map(tool => ({ name: tool.function.name, description: tool.function.description || '', inputSchema: tool.function.parameters || { type: 'object', properties: {} } })) };
         else if (msg.method === 'tools/call') {
           const name = msg.params.name;
@@ -142,8 +151,8 @@ export async function createBridge(directory: string, options: { cli?: string; m
         const reuse = existing && conversations.get(conversationKey) === existing && existing.reusable && existing.client === client && client.alive
           && existing.effort === effort && existing.cwd === cwd && existing.toolsDigest === toolsDigest ? followUp(existing.history, messages, hashes) : undefined;
         if (existing && !reuse) forget(existing);
-        const conversation: Conversation = reuse ? existing! : { key: conversationKey, token: crypto.randomUUID(), client, sessionId: '', effort, cwd, tools, toolsDigest, history: [], seen: [], reusable: false };
-        conversation.seen = hashes;
+        const conversation: Conversation = reuse ? existing! : { key: conversationKey, token: crypto.randomUUID(), client, sessionId: '', effort, cwd, tools, toolsDigest, history: [], seen: [], reusable: false, used: 0 };
+        conversation.seen = hashes; conversation.used = performance.now();
         turn = { conversation, queue: new Queue(), results: new Map(), completed: false, stopped: false, published: new Set() };
         conversation.turn = turn;
         const active = turn;
@@ -186,6 +195,7 @@ export async function createBridge(directory: string, options: { cli?: string; m
             conversation.history = conversation.seen;
             conversation.reusable = kind === 'primary' && result.stopReason === 'end_turn';
             if (!conversation.reusable) forget(conversation);
+            conversation.used = performance.now(); sweep();
             pool.release(client);
             active.queue.push({ type: 'done' });
           } catch (error) {
@@ -257,6 +267,6 @@ export async function createBridge(directory: string, options: { cli?: string; m
     // Start the default Kiro process ahead of the first message. No model request is made.
     async prewarm() { await pool.prewarm(directory); },
     async cancel(sessionID: string) { await stopAll(conversation => conversation.key.startsWith(sessionID + ':')); },
-    async stop() { await stopAll(() => true); await pool.stop(); await server.stop(true); },
+    async stop() { clearInterval(sweeper); await stopAll(() => true); await pool.stop(); await server.stop(true); },
   };
 }

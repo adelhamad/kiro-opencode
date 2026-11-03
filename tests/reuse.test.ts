@@ -79,3 +79,18 @@ test('follow-up detection accepts only appended user turns', () => {
   expect(followUp(history, [...seen, m('assistant', '', { tool_calls: [{ id: 'x' }] }), m('tool', 'r')])).toBeUndefined();
   expect(followUp([], [m('user', 'u1')])).toBeUndefined();
 });
+
+test('only recent idle conversations keep their Kiro session', async () => {
+  const bridge = await createBridge(process.cwd(), { cli: resolve('tests/fixtures/kiro'), keep: 1 });
+  const ask = async (session: string, messages: any[]) => {
+    const text = await (await fetch(bridge.url + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${bridge.secret}`, 'x-opencode-session': session }, body: JSON.stringify({ model: 'test', stream: true, messages, tools }) })).text();
+    return JSON.parse(text.split('\n').filter(l => l.startsWith('data: {')).map(l => JSON.parse(l.slice(6))).map(c => c.choices?.[0]?.delta?.content || '').join(''));
+  };
+  try {
+    const a = await ask('keep-a', [{ role: 'user', content: 'A ECHO' }]);
+    await ask('keep-b', [{ role: 'user', content: 'B ECHO' }]);
+    const again = await ask('keep-a', [{ role: 'user', content: 'A ECHO' }, { role: 'assistant', content: 'x' }, { role: 'user', content: 'More ECHO' }]);
+    expect(again.sessionId).not.toBe(a.sessionId);
+    expect(again.terminated).toContain(a.sessionId);
+  } finally { await bridge.stop(); }
+});
