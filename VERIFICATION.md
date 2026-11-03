@@ -9,7 +9,7 @@ OpenCode 2.2.5, Kiro CLI 2.37.1, Bun 1.4.2 on macOS, model `kiro/claude-sonnet-4
 - A held MCP tool call survived 200 seconds through the stdio relay. Kiro's HTTP MCP transport failed after about 120 seconds, so the relay stays on stdio.
 - Stopping OpenCode normally, and killing it with SIGKILL, both left no `kiro-cli` or relay processes behind.
 
-Benchmark: the same three-turn conversation, run three times against two private OpenCode servers, one with the previous release and one with this version. Turn 1 asks to read a file, turn 2 asks about README headings (it uses a tool), and turn 3 is "Reply with just DONE." Times are from request to first streamed event, as measured by the bridge. Credits are Kiro's own `meteringUsage` reports. Values are medians.
+Benchmark: the same three-turn conversation, run three times against two private OpenCode servers, one with the previous release and one with this version. Turn 1 asks to read a file, but in every run of both versions the model answered without calling a tool. Turn 2 asks about README headings and does call a tool. Turn 3 is "Reply with just DONE." Times are from request to first streamed event, as measured by the bridge. Credits are Kiro's own `meteringUsage` reports. Values are medians.
 
 | Turn | Previous: first event | This version: first event | Previous: credits | This version: credits |
 |---|---|---|---|---|

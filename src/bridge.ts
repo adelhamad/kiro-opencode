@@ -2,7 +2,7 @@ import { AcpPool, type AcpClient } from './acp';
 import { forgetAuthentication, isAuthError } from './auth';
 import { promptBlocks, toolResult } from './prompt';
 import { estimatedUsage } from './usage';
-import { debug, shape } from './debug';
+import { debug, debugEnabled, shape } from './debug';
 import { fileURLToPath } from 'node:url';
 
 type Json = Record<string, any>;
@@ -85,9 +85,9 @@ export async function createBridge(directory: string, options: { cli?: string; m
       const url = new URL(request.url);
       if (url.pathname.startsWith('/mcp/')) {
         const conversation = tokens.get(url.pathname.slice(5));
-        if (!conversation) return Response.json({ error: 'Unknown MCP session' }, { status: 404 });
         let msg: Json;
         try { msg = await request.json(); } catch { return Response.json({ error: 'Invalid JSON' }, { status: 400 }); }
+        if (!conversation) return msg.id === undefined ? new Response(null, { status: 204 }) : Response.json({ jsonrpc: '2.0', id: msg.id, error: { code: -32001, message: 'Unknown MCP session' } });
         let result: any = {};
         if (msg.method === 'initialize') result = { protocolVersion: msg.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: 'opencode', version: '0.2.0' } };
         else if (msg.method === 'tools/list') result = { tools: conversation.tools.map(tool => ({ name: tool.function.name, description: tool.function.description || '', inputSchema: tool.function.parameters || { type: 'object', properties: {} } })) };
@@ -117,7 +117,7 @@ export async function createBridge(directory: string, options: { cli?: string; m
       const conversationKey = `${key}:${kind}`;
       const existing = conversations.get(conversationKey);
       const continuing = existing?.turn && existing.turn.results.size ? existing.turn : undefined;
-      debug('request', { key: conversationKey, model: body.model, effort: body.reasoning_effort, tools: (body.tools || []).length, continuation: Boolean(continuing), messages: shape(messages) });
+      if (debugEnabled) debug('request', { key: conversationKey, model: body.model, effort: body.reasoning_effort, tools: (body.tools || []).length, continuation: Boolean(continuing), messages: shape(messages) });
       let turn: Turn;
       if (continuing) {
         turn = continuing;

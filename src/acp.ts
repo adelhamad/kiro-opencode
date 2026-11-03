@@ -129,8 +129,12 @@ export class AcpPool {
     const current = entry;
     if (current.idle) { clearTimeout(current.idle); current.idle = undefined; }
     current.users++;
-    try { await current.ready; return current.client; }
-    catch (error) { this.release(current.client); await this.discard(current.client); throw error; }
+    try {
+      await current.ready;
+      // A warm process still honors sign-out: the watcher refreshes this result every 30 s.
+      await ensureAuthenticated(this.cli);
+      return current.client;
+    } catch (error) { this.release(current.client); await this.discard(current.client); throw error; }
   }
   release(client: AcpClient) {
     for (const entry of this.entries.values()) {
