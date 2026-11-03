@@ -3,6 +3,7 @@ import { isAuthError } from './auth';
 import { promptBlocks, toolResult } from './prompt';
 import { estimatedUsage } from './usage';
 import { fileURLToPath } from 'node:url';
+import { debug, shape } from './debug';
 
 type Json = Record<string, any>;
 type Event = { type: 'text' | 'reasoning'; text: string } | { type: 'tool'; id: string; name: string; args: any } | { type: 'done' } | { type: 'error'; message: string };
@@ -60,6 +61,8 @@ export async function createBridge(directory: string, options: { cli?: string; m
       const kind = request.headers.get('x-opencode-kind') || 'primary';
       const turnKey = `${key}:${kind}`;
       let turn = turns.get(turnKey);
+      const received = Date.now();
+      debug('request', { key: turnKey, model: body.model, effort: body.reasoning_effort, tools: (body.tools || []).length, continuation: Boolean(turn && turn.results.size), messages: shape(body.messages) });
       const toolMessages = (body.messages || []).filter((m: Json) => m.role === 'tool');
       if (turn && turn.results.size) {
         // Set up the next response before unblocking Kiro's pending MCP request.
@@ -82,12 +85,14 @@ export async function createBridge(directory: string, options: { cli?: string; m
           const content = update?.content;
           if (content?.type === 'text' && update.sessionUpdate === 'agent_message_chunk') active.queue.push({ type: 'text', text: content.text });
           if (content?.type === 'text' && update.sessionUpdate === 'agent_thought_chunk') active.queue.push({ type: 'reasoning', text: content.text });
+          if (msg.params?.meteringUsage) debug('metering', { key: active.key, credits: msg.params.meteringUsage.reduce((sum: number, item: Json) => sum + (item.value || 0), 0), turnDurationMs: msg.params.turnDurationMs, context: msg.params.contextUsagePercentage });
         };
         const abortStartup = () => { void stopTurn(active); };
         request.signal.addEventListener('abort', abortStartup, { once: true });
         try {
           if (request.signal.aborted) await stopTurn(active);
           await active.client.start(options.cli, typeof body.reasoning_effort === 'string' ? body.reasoning_effort : undefined);
+          debug('started', { key: turnKey, ms: Date.now() - received });
         } catch (error) {
           await stopTurn(active);
           const message = String(error);
@@ -99,6 +104,7 @@ export async function createBridge(directory: string, options: { cli?: string; m
             active.sessionId = session.sessionId;
             await active.client.call('session/set_model', { sessionId: active.sessionId, modelId: body.model === 'auto' ? (options.model || 'claude-sonnet-4.6') : body.model });
             const prompt = promptBlocks(body.messages || []);
+            debug('prompt', { key: turnKey, ms: Date.now() - received, chars: prompt[0]!.text.length, fresh: true });
             const result = await active.client.call('session/prompt', { sessionId: active.sessionId, prompt }, 900_000);
             if (!['end_turn', 'max_tokens'].includes(result.stopReason)) throw new Error(`Kiro stopped with ${result.stopReason}`);
             active.completed = true; active.queue.push({ type: 'done' });
@@ -120,9 +126,12 @@ export async function createBridge(directory: string, options: { cli?: string; m
           const emit = (data: any) => { if (!closed) controller.enqueue(encoder.encode(`data: ${typeof data === 'string' ? data : JSON.stringify(data)}\n\n`)); };
           const heartbeat = setInterval(() => { if (!closed) controller.enqueue(encoder.encode(': keepalive\n\n')); }, 10_000);
           emit(chunk({ role: 'assistant' }));
+          let first = true;
           void (async () => {
             while (!closed) {
               const event = await active.queue.next();
+              if (first) { first = false; debug('first_event', { key: active.key, type: event.type, ms: Date.now() - received }); }
+              if (event.type === 'done' || event.type === 'error' || event.type === 'tool') debug('response_end', { key: active.key, type: event.type, ms: Date.now() - received });
               if (event.type === 'text') { output += event.text; emit(chunk({ content: event.text })); }
               else if (event.type === 'reasoning') { output += event.text; emit(chunk({ reasoning_content: event.text })); }
               else if (event.type === 'tool') {
