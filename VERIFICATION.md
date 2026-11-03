@@ -1,5 +1,27 @@
 # Verification
 
+## Warm sessions and follow-up prompts (2026-11-03)
+
+OpenCode 2.2.5, Kiro CLI 2.37.1, Bun 1.4.2 on macOS, model `kiro/claude-sonnet-4.6`.
+
+- `bun run typecheck`, `bun test` (19 tests, 80 assertions), `bun run test:auth` and `bun run test:install` passed.
+- `bun run test:e2e` passed all 14 live checks listed below. The `KIRO_OPENCODE_DEBUG` log showed follow-up messages reusing the Kiro session, and fresh sessions after an interruption and for title/compaction requests.
+- A held MCP tool call survived 200 seconds through the stdio relay. Kiro's HTTP MCP transport failed after about 120 seconds, so the relay stays on stdio.
+- Stopping OpenCode normally, and killing it with SIGKILL, both left no `kiro-cli` or relay processes behind.
+
+Benchmark: the same three-turn conversation, run three times against two private OpenCode servers, one with the previous release and one with this version. Turn 1 asks to read a file, turn 2 asks about README headings (it uses a tool), and turn 3 is "Reply with just DONE." Times are from request to first streamed event, as measured by the bridge. Credits are Kiro's own `meteringUsage` reports. Values are medians.
+
+| Turn | Previous: first event | This version: first event | Previous: credits | This version: credits |
+|---|---|---|---|---|
+| 1 (new conversation) | 7.35 s | 3.17 s | 0.076 | 0.078 |
+| 2 (follow-up with tool call) | 7.76 s | 1.98 s | 0.149 | 0.131 |
+| 3 (short follow-up) | 7.07 s | 1.10 s | 0.076 | 0.043 |
+| Whole conversation | | | 0.306 | 0.255 |
+
+On follow-ups the bridge sent Kiro 30–96 characters instead of a 23–26 KB replayed transcript. For comparison, the same turns in a warm native Kiro CLI session (default agent, no OpenCode system prompt or tools) took 1.03–1.06 s to the first text and 0.037–0.038 credits on turn 3. One-shot `kiro-cli chat --no-interactive --resume` took 6.0–7.8 s per turn.
+
+## Earlier verification
+
 Live verification on 2026-10-05 with OpenCode 2.0.23, Kiro CLI 2.25.0 and Bun 1.4.2 on macOS. Model: `kiro/claude-sonnet-4.6`, using the existing authenticated Kiro account. These checks consume real model credits.
 
 ## Live OpenCode suite
