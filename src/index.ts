@@ -15,7 +15,11 @@ export default Plugin.define({
     catch (error) { console.warn(String(error)); }
     const bridge = await createBridge(ctx.location.directory, {
       cli, model: typeof ctx.options.model === 'string' ? ctx.options.model : undefined,
+      idleMs: typeof ctx.options.idleMinutes === 'number' ? ctx.options.idleMinutes * 60_000 : undefined,
     });
+    // Signed in: start Kiro now so the first message skips process startup.
+    const prewarm = () => { if (ctx.options.prewarm !== false) void bridge.prewarm(); };
+    if (inventory.length) prewarm();
     try {
       const id = Provider.ID.make('kiro');
       await ctx.provider.transform(editor => {
@@ -36,7 +40,7 @@ export default Plugin.define({
       }, { providerID: 'kiro' });
       watching = watchModels({
         cli, signal: controller.signal,
-        async update(models) { inventory = models; await ctx.provider.reload(); },
+        async update(models) { inventory = models; await ctx.provider.reload(); prewarm(); },
         report(message) { console.warn(message); },
       });
       void (async () => {

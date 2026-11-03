@@ -1,7 +1,8 @@
-import { AcpClient } from './acp';
-import { isAuthError } from './auth';
+import { AcpPool, type AcpClient } from './acp';
+import { forgetAuthentication, isAuthError } from './auth';
 import { promptBlocks, toolResult } from './prompt';
 import { estimatedUsage } from './usage';
+import { debug, debugEnabled, shape } from './debug';
 import { fileURLToPath } from 'node:url';
 
 type Json = Record<string, any>;
@@ -12,36 +13,89 @@ class Queue {
   push(item: Event) { if (this.waiting) { const next = this.waiting; this.waiting = undefined; next(item); } else this.items.push(item); }
   next(): Promise<Event> { const item = this.items.shift(); return item ? Promise.resolve(item) : new Promise(resolve => this.waiting = resolve); }
 }
-interface Turn {
-  key: string; token: string; client: AcpClient; sessionId?: string; tools: Json[]; queue: Queue;
-  results: Map<string, (result: any) => void>; completed: boolean; stopped: boolean; published: Set<string>; timer?: ReturnType<typeof setTimeout>;
+// One Kiro session for one OpenCode conversation (session ID + request kind).
+// `history` holds digests of the OpenCode messages Kiro has already received,
+// so a follow-up message can be sent alone instead of replaying the transcript.
+interface Conversation {
+  key: string; token: string; client: AcpClient; sessionId: string; effort: string; cwd: string; model?: string;
+  tools: Json[]; toolsDigest: string; history: string[]; seen: string[]; reusable: boolean; turn?: Turn; used: number;
 }
-export async function createBridge(directory: string, options: { cli?: string; model?: string } = {}) {
+interface Turn {
+  conversation: Conversation; queue: Queue; results: Map<string, (result: any) => void>;
+  completed: boolean; stopped: boolean; published: Set<string>; timer?: ReturnType<typeof setTimeout>;
+}
+const digest = (value: unknown) => new Bun.CryptoHasher('sha256').update(JSON.stringify(value) ?? '').digest('hex');
+
+// Messages after the part Kiro already has, or undefined when the history was
+// changed (undo, compaction, edited instructions) and a fresh session is needed.
+export function followUp(history: string[], messages: Json[], hashes = messages.map(digest)) {
+  if (!history.length || hashes.length <= history.length) return;
+  for (let index = 0; index < history.length; index++) if (hashes[index] !== history[index]) return;
+  let rest = messages.slice(history.length);
+  // Kiro produced the final assistant reply itself; it is already in its session.
+  if (rest[0]?.role === 'assistant' && !rest[0].tool_calls?.length) rest = rest.slice(1);
+  if (!rest.length || rest.some(message => message.role !== 'user' && message.role !== 'system')) return;
+  return rest;
+}
+
+export async function createBridge(directory: string, options: { cli?: string; model?: string; idleMs?: number; keep?: number } = {}) {
   const secret = crypto.randomUUID();
-  const turns = new Map<string, Turn>();
-  const tokens = new Map<string, Turn>();
+  const idleMs = options.idleMs ?? 15 * 60_000;
+  const pool = new AcpPool(options.cli, idleMs);
+  const conversations = new Map<string, Conversation>();
+  const tokens = new Map<string, Conversation>();
+  // Ending the Kiro session also stops its MCP relay process.
+  const forget = (conversation: Conversation) => {
+    tokens.delete(conversation.token);
+    if (conversations.get(conversation.key) === conversation) conversations.delete(conversation.key);
+    conversation.reusable = false;
+    if (!conversation.sessionId) return;
+    conversation.client.onUpdate(conversation.sessionId);
+    conversation.client.terminate(conversation.sessionId);
+    conversation.sessionId = '';
+  };
+  // Each kept conversation holds a Kiro session and an MCP relay process, so
+  // keep only recent idle ones; an expired conversation restarts with the transcript.
+  const sweep = () => {
+    const idle = [...conversations.values()].filter(conversation => !conversation.turn).sort((a, b) => b.used - a.used);
+    idle.forEach((conversation, index) => { if (index >= (options.keep ?? 8) || performance.now() - conversation.used > idleMs) forget(conversation); });
+  };
+  const sweeper = setInterval(sweep, 60_000);
+  sweeper.unref?.();
+  // Cancel only this Kiro session: the process is shared. A cancelled Kiro
+  // session can answer later prompts with an immediate cancellation, so drop it.
   const stopTurn = async (turn: Turn) => {
     if (turn.stopped) return;
     turn.stopped = true;
     if (turn.timer) clearTimeout(turn.timer);
     for (const resolve of turn.results.values()) resolve({ content: [{ type: 'text', text: 'OpenCode cancelled this tool call.' }], isError: true });
-    turn.results.clear(); tokens.delete(turn.token); if (turns.get(turn.key) === turn) turns.delete(turn.key);
+    turn.results.clear();
     turn.queue.push({ type: 'error', message: 'Generation cancelled' });
-    await turn.client.stop();
+    const conversation = turn.conversation;
+    if (!turn.completed) conversation.client.notify('session/cancel', { sessionId: conversation.sessionId });
+    if (conversation.turn === turn) conversation.turn = undefined;
+    forget(conversation);
+    if (!turn.completed) { turn.completed = true; pool.release(conversation.client); }
   };
+  // Stdio relay: Kiro's HTTP MCP client gives up on a tool call after about two
+  // minutes, which is shorter than an OpenCode permission prompt may wait.
+  const mcpServer = (token: string) => ({ name: 'opencode', command: Bun.which('bun') || 'bun', args: [fileURLToPath(new URL('./mcp.ts', import.meta.url)), `${server.url}mcp/${token}`], env: [] });
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, idleTimeout: 0,
     async fetch(request) {
       const url = new URL(request.url);
       if (url.pathname.startsWith('/mcp/')) {
-        const turn = tokens.get(url.pathname.slice(5));
-        if (!turn) return Response.json({ error: 'Unknown MCP session' }, { status: 404 });
-        const msg: Json = await request.json();
+        const conversation = tokens.get(url.pathname.slice(5));
+        let msg: Json;
+        try { msg = await request.json(); } catch { return Response.json({ error: 'Invalid JSON' }, { status: 400 }); }
+        if (!conversation) return msg.id === undefined ? new Response(null, { status: 204 }) : Response.json({ jsonrpc: '2.0', id: msg.id, error: { code: -32001, message: 'Unknown MCP session' } });
         let result: any = {};
         if (msg.method === 'initialize') result = { protocolVersion: msg.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: 'opencode', version: '0.2.0' } };
-        else if (msg.method === 'tools/list') result = { tools: turn.tools.map(tool => ({ name: tool.function.name, description: tool.function.description || '', inputSchema: tool.function.parameters || { type: 'object', properties: {} } })) };
+        else if (msg.method === 'tools/list') result = { tools: conversation.tools.map(tool => ({ name: tool.function.name, description: tool.function.description || '', inputSchema: tool.function.parameters || { type: 'object', properties: {} } })) };
         else if (msg.method === 'tools/call') {
           const name = msg.params.name;
-          if (!turn.tools.some(tool => tool.function.name === name)) return Response.json({ jsonrpc: '2.0', id: msg.id, error: { code: -32602, message: 'Unknown tool' } });
+          const turn = conversation.turn;
+          if (!conversation.tools.some(tool => tool.function.name === name)) return Response.json({ jsonrpc: '2.0', id: msg.id, error: { code: -32602, message: 'Unknown tool' } });
+          if (!turn || turn.stopped) return Response.json({ jsonrpc: '2.0', id: msg.id, result: { content: [{ type: 'text', text: 'OpenCode cancelled this tool call.' }], isError: true } });
           const id = 'call_' + crypto.randomUUID().replaceAll('-', '');
           result = await new Promise(resolve => {
             turn.results.set(id, resolve);
@@ -56,53 +110,108 @@ export async function createBridge(directory: string, options: { cli?: string; m
       if (url.pathname !== '/v1/chat/completions' || request.method !== 'POST') return Response.json({ error: { message: 'Not found' } }, { status: 404 });
       let body: Json;
       try { body = await request.json(); } catch { return Response.json({ error: { message: 'Invalid JSON' } }, { status: 400 }); }
+      const received = Date.now();
+      const messages: any[] = body.messages || [];
       const key = request.headers.get('x-opencode-session') || crypto.randomUUID();
       const kind = request.headers.get('x-opencode-kind') || 'primary';
-      const turnKey = `${key}:${kind}`;
-      let turn = turns.get(turnKey);
-      const toolMessages = (body.messages || []).filter((m: Json) => m.role === 'tool');
-      if (turn && turn.results.size) {
+      const conversationKey = `${key}:${kind}`;
+      const existing = conversations.get(conversationKey);
+      const continuing = existing?.turn && existing.turn.results.size ? existing.turn : undefined;
+      if (debugEnabled) debug('request', { key: conversationKey, model: body.model, effort: body.reasoning_effort, tools: (body.tools || []).length, continuation: Boolean(continuing), messages: shape(messages) });
+      let turn: Turn;
+      if (continuing) {
+        turn = continuing;
         // Set up the next response before unblocking Kiro's pending MCP request.
+        const toolMessages = messages.filter(m => m.role === 'tool');
         const unresolved = [...turn.published];
         for (const id of unresolved) {
-          const msg = toolMessages.findLast((m: Json) => m.tool_call_id === id);
+          const msg = toolMessages.findLast(m => m.tool_call_id === id);
           if (!msg) return Response.json({ error: { message: `Missing result for tool call ${id}` } }, { status: 400 });
         }
+        turn.conversation.seen = messages.map(digest);
         for (const id of unresolved) {
-          turn.results.get(id)!(toolResult(body.messages, id));
+          turn.results.get(id)!(toolResult(messages, id));
           turn.results.delete(id); turn.published.delete(id);
         }
       } else {
-        if (turn) await stopTurn(turn);
-        turn = { key: turnKey, token: crypto.randomUUID(), client: new AcpClient(), tools: body.tools || [], queue: new Queue(), results: new Map(), completed: false, stopped: false, published: new Set() };
-        turns.set(turnKey, turn); tokens.set(turn.token, turn);
+        if (existing?.turn) await stopTurn(existing.turn);
+        const effort = typeof body.reasoning_effort === 'string' ? body.reasoning_effort : '';
+        const cwd = request.headers.get('x-opencode-directory') || directory;
+        const tools: Json[] = body.tools || [];
+        const toolsDigest = digest(tools);
+        const model = body.model === 'auto' ? (options.model || 'claude-sonnet-4.6') : body.model;
+        const hashes = messages.map(digest);
+        let client: AcpClient;
+        try { client = await pool.acquire(effort || undefined); }
+        catch (error) {
+          const message = String(error);
+          return Response.json({ error: { message, type: isAuthError(message) ? 'authentication_error' : 'kiro_error' } }, { status: isAuthError(message) ? 401 : 502, headers: { 'x-should-retry': 'false' } });
+        }
+        debug('started', { key: conversationKey, ms: Date.now() - received });
+        const reuse = existing && conversations.get(conversationKey) === existing && existing.reusable && existing.client === client && client.alive
+          && existing.effort === effort && existing.cwd === cwd && existing.toolsDigest === toolsDigest ? followUp(existing.history, messages, hashes) : undefined;
+        if (existing && !reuse) forget(existing);
+        const conversation: Conversation = reuse ? existing! : { key: conversationKey, token: crypto.randomUUID(), client, sessionId: '', effort, cwd, tools, toolsDigest, history: [], seen: [], reusable: false, used: 0 };
+        conversation.seen = hashes; conversation.used = performance.now();
+        turn = { conversation, queue: new Queue(), results: new Map(), completed: false, stopped: false, published: new Set() };
+        conversation.turn = turn;
         const active = turn;
-        active.client.onUpdate = msg => {
+        const listen = (msg: Json) => {
+          if (conversation.turn !== active) return;
           const update = msg.params?.update;
           const content = update?.content;
           if (content?.type === 'text' && update.sessionUpdate === 'agent_message_chunk') active.queue.push({ type: 'text', text: content.text });
           if (content?.type === 'text' && update.sessionUpdate === 'agent_thought_chunk') active.queue.push({ type: 'reasoning', text: content.text });
+          if (msg.params?.meteringUsage) debug('metering', { key: conversation.key, credits: msg.params.meteringUsage.reduce((sum: number, item: Json) => sum + (item.value || 0), 0), turnDurationMs: msg.params.turnDurationMs, context: msg.params.contextUsagePercentage });
         };
         const abortStartup = () => { void stopTurn(active); };
         request.signal.addEventListener('abort', abortStartup, { once: true });
-        try {
-          if (request.signal.aborted) await stopTurn(active);
-          await active.client.start(options.cli, typeof body.reasoning_effort === 'string' ? body.reasoning_effort : undefined);
-        } catch (error) {
-          await stopTurn(active);
-          const message = String(error);
-          return Response.json({ error: { message, type: isAuthError(message) ? 'authentication_error' : 'kiro_error' } }, { status: isAuthError(message) ? 401 : 502, headers: { 'x-should-retry': 'false' } });
-        } finally { request.signal.removeEventListener('abort', abortStartup); }
+        if (request.signal.aborted) void stopTurn(active);
         void (async () => {
           try {
-            const session = await active.client.call('session/new', { cwd: request.headers.get('x-opencode-directory') || directory, mcpServers: [{ name: 'opencode', command: Bun.which('bun') || 'bun', args: [fileURLToPath(new URL('./mcp.ts', import.meta.url)), `${server.url}mcp/${active.token}`], env: [] }] });
-            active.sessionId = session.sessionId;
-            await active.client.call('session/set_model', { sessionId: active.sessionId, modelId: body.model === 'auto' ? (options.model || 'claude-sonnet-4.6') : body.model });
-            const prompt = promptBlocks(body.messages || []);
-            const result = await active.client.call('session/prompt', { sessionId: active.sessionId, prompt }, 900_000);
+            if (!reuse) {
+              // Kiro initializes the MCP server during session/new.
+              tokens.set(conversation.token, conversation);
+              conversations.set(conversationKey, conversation);
+              const session = await client.call('session/new', { cwd, mcpServers: tools.length ? [mcpServer(conversation.token)] : [] });
+              conversation.sessionId = session.sessionId;
+            }
+            if (active.stopped) { if (!reuse) forget(conversation); throw new Error('Generation cancelled'); }
+            client.onUpdate(conversation.sessionId, listen);
+            if (conversation.model !== model) {
+              await client.call('session/set_model', { sessionId: conversation.sessionId, modelId: model });
+              conversation.model = model;
+            }
+            const prompt = promptBlocks(reuse || messages);
+            debug('prompt', { key: conversationKey, ms: Date.now() - received, chars: prompt[0]!.text.length, fresh: !reuse, sent: (reuse || messages).length, of: messages.length });
+            if (active.stopped) throw new Error('Generation cancelled');
+            const result = await client.call('session/prompt', { sessionId: conversation.sessionId, prompt }, 900_000);
             if (!['end_turn', 'max_tokens'].includes(result.stopReason)) throw new Error(`Kiro stopped with ${result.stopReason}`);
-            active.completed = true; active.queue.push({ type: 'done' });
-          } catch (error) { active.completed = true; active.queue.push({ type: 'error', message: String(error) }); }
+            if (active.stopped) return;
+            active.completed = true;
+            if (active.timer) clearTimeout(active.timer);
+            conversation.turn = undefined;
+            // Only primary conversations continue; titles and summaries are one-shot.
+            conversation.history = conversation.seen;
+            conversation.reusable = kind === 'primary' && result.stopReason === 'end_turn';
+            if (!conversation.reusable) forget(conversation);
+            conversation.used = performance.now(); sweep();
+            pool.release(client);
+            active.queue.push({ type: 'done' });
+          } catch (error) {
+            const message = String(error);
+            if (active.stopped) return;
+            active.stopped = true;
+            if (active.timer) clearTimeout(active.timer);
+            if (conversation.sessionId) client.notify('session/cancel', { sessionId: conversation.sessionId });
+            active.completed = true;
+            if (conversation.turn === active) conversation.turn = undefined;
+            forget(conversation);
+            pool.release(client);
+            // A new process re-checks authentication after the user signs in again.
+            if (isAuthError(message)) { forgetAuthentication(); void pool.discard(client); }
+            active.queue.push({ type: 'error', message });
+          } finally { request.signal.removeEventListener('abort', abortStartup); }
         })();
       }
       const active = turn;
@@ -114,15 +223,20 @@ export async function createBridge(directory: string, options: { cli?: string; m
       const model = body.model;
       const chunk = (delta: Json, finish_reason: string | null = null) => ({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta, finish_reason }] });
       const encoder = new TextEncoder(); let closed = false; let output = '';
-      const usageChunk = () => ({ ...chunk({}), choices: [], usage: estimatedUsage(body.messages, body.tools, output), kiro_usage_estimated: true });
+      // Usage describes the full OpenCode context, not the shorter follow-up
+      // prompt, because OpenCode uses it for context accounting and compaction.
+      const usageChunk = () => ({ ...chunk({}), choices: [], usage: estimatedUsage(messages, body.tools, output), kiro_usage_estimated: true });
       const stream = new ReadableStream({
         start(controller) {
           const emit = (data: any) => { if (!closed) controller.enqueue(encoder.encode(`data: ${typeof data === 'string' ? data : JSON.stringify(data)}\n\n`)); };
           const heartbeat = setInterval(() => { if (!closed) controller.enqueue(encoder.encode(': keepalive\n\n')); }, 10_000);
           emit(chunk({ role: 'assistant' }));
+          let first = true;
           void (async () => {
             while (!closed) {
               const event = await active.queue.next();
+              if (first) { first = false; debug('first_event', { key: active.conversation.key, type: event.type, ms: Date.now() - received }); }
+              if (event.type === 'done' || event.type === 'error' || event.type === 'tool') debug('response_end', { key: active.conversation.key, type: event.type, ms: Date.now() - received });
               if (event.type === 'text') { output += event.text; emit(chunk({ content: event.text })); }
               else if (event.type === 'reasoning') { output += event.text; emit(chunk({ reasoning_content: event.text })); }
               else if (event.type === 'tool') {
@@ -135,8 +249,8 @@ export async function createBridge(directory: string, options: { cli?: string; m
           })().finally(() => {
             clearInterval(heartbeat); request.signal.removeEventListener('abort', abort);
             if (!closed) { closed = true; controller.close(); }
-            if (active.completed) void stopTurn(active);
-            else if (!active.stopped) active.timer = setTimeout(() => void stopTurn(active), 300_000);
+            // A published tool call waits for OpenCode's result in the next request.
+            if (!active.completed && !active.stopped) active.timer = setTimeout(() => void stopTurn(active), 300_000);
           });
         },
         cancel() { closed = true; void stopTurn(active); },
@@ -144,5 +258,15 @@ export async function createBridge(directory: string, options: { cli?: string; m
       return new Response(stream, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' } });
     },
   });
-  return { url: `${server.url}v1`, secret, async cancel(sessionID: string) { await Promise.all([...turns.values()].filter(turn => turn.key.startsWith(sessionID + ':')).map(stopTurn)); }, async stop() { await Promise.all([...turns.values()].map(stopTurn)); await server.stop(true); } };
+  const stopAll = (filter: (conversation: Conversation) => boolean) => Promise.all([...conversations.values(), ...tokens.values()].filter(filter).map(conversation => {
+    if (conversation.turn) return stopTurn(conversation.turn);
+    forget(conversation);
+  }));
+  return {
+    url: `${server.url}v1`, secret,
+    // Start the default Kiro process ahead of the first message. No model request is made.
+    async prewarm() { await pool.prewarm(directory); },
+    async cancel(sessionID: string) { await stopAll(conversation => conversation.key.startsWith(sessionID + ':')); },
+    async stop() { clearInterval(sweeper); await stopAll(() => true); await pool.stop(); await server.stop(true); },
+  };
 }

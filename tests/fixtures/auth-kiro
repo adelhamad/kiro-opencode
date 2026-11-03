@@ -26,8 +26,11 @@ for await (const bytes of Bun.stdin.stream()) {
     const msg = JSON.parse(line);
     const send = (value: unknown) => console.log(JSON.stringify(value));
     if (msg.method === 'session/prompt') {
-      if (state.promptFailure) { send({ id: msg.id, error: { message: 'Authentication expired', data: { token: 'SECRET' } } }); continue; }
-      send({ method: 'session/update', params: { update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'RECOVERED' } } } });
+      // A running CLI notices logout or expiry when the request reaches Kiro.
+      const now = await Bun.file(import.meta.path + '.json').json();
+      if (now.acpFailure) { console.error('Authentication expired https://example.invalid/?token=SECRET'); process.exit(1); }
+      if (!now.loggedIn || now.promptFailure) { send({ id: msg.id, error: { message: 'Authentication expired', data: { token: 'SECRET' } } }); continue; }
+      send({ method: 'session/update', params: { sessionId: msg.params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'RECOVERED' } } } });
     }
     send({ id: msg.id, result: msg.method === 'session/new' ? { sessionId: 'test' } : msg.method === 'session/prompt' ? { stopReason: 'end_turn' } : {} });
   }
