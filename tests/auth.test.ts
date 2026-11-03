@@ -86,7 +86,8 @@ test('plugin setup remains active when authentication is missing', async () => {
 
 test('same bridge recovers from expired auth, ACP exit and mid-request expiry', async () => {
   const f = await fixture();
-  const bridge = await createBridge(process.cwd(), { cli: f.cli });
+  // No warm process: every request launches Kiro, exercising each failure path.
+  const bridge = await createBridge(process.cwd(), { cli: f.cli, idleMs: 0 });
   const ask = async () => (await fetch(bridge.url + '/chat/completions', {
     method: 'POST', headers: { authorization: `Bearer ${bridge.secret}`, 'x-opencode-session': 'same-session' },
     body: JSON.stringify({ model: 'test-model', messages: [{ role: 'user', content: 'hello' }], stream: true }),

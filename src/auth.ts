@@ -39,6 +39,15 @@ export async function runCli(cli: string, args: string[], signal?: AbortSignal, 
   }
 }
 
+// The model watcher re-checks every 30 seconds. Starting Kiro reuses a recent
+// success instead of paying for another `whoami` (about 2 seconds) per launch.
+const verified = new Map<string, number>();
 export async function checkAuthentication(cli = 'kiro-cli', signal?: AbortSignal) {
-  await runCli(cli, ['whoami', '--format', 'json'], signal);
+  try { await runCli(cli, ['whoami', '--format', 'json'], signal); verified.set(cli, Date.now()); }
+  catch (error) { verified.delete(cli); throw error; }
 }
+export async function ensureAuthenticated(cli = 'kiro-cli', signal?: AbortSignal, maxAge = 90_000) {
+  if (Date.now() - (verified.get(cli) ?? -Infinity) < maxAge) return;
+  await checkAuthentication(cli, signal);
+}
+export function forgetAuthentication() { verified.clear(); }

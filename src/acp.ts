@@ -1,9 +1,11 @@
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { checkAuthentication, isAuthError, loginInstruction, killCli } from './auth';
+import { ensureAuthenticated, forgetAuthentication, isAuthError, loginInstruction, killCli } from './auth';
 
 type Rpc = Record<string, any>;
+// One `kiro-cli acp` process. It hosts many concurrent Kiro sessions, so a
+// cancelled or failed conversation cancels its session instead of the process.
 export class AcpClient {
   private child?: ReturnType<typeof Bun.spawn>;
   private directory?: string;
@@ -14,10 +16,14 @@ export class AcpClient {
   private controller = new AbortController();
   private diagnostics = Promise.resolve('');
   private pending = new Map<number, { resolve(value: any): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }>();
-  onUpdate: (params: Rpc) => void = () => {};
+  private listeners = new Map<string, (msg: Rpc) => void>();
+  get alive() { return !this.failure && !this.closed; }
+  onUpdate(sessionId: string, listener?: (msg: Rpc) => void) {
+    if (listener) this.listeners.set(sessionId, listener); else this.listeners.delete(sessionId);
+  }
   async start(cli = 'kiro-cli', effort?: string) {
     this.cli = cli;
-    await checkAuthentication(cli, this.controller.signal);
+    await ensureAuthenticated(cli, this.controller.signal);
     this.directory = await mkdtemp(join(tmpdir(), 'opencode-kiro-'));
     await mkdir(join(this.directory, '.kiro/agents'), { recursive: true });
     await writeFile(join(this.directory, '.kiro/agents/opencode.json'), JSON.stringify({
@@ -41,9 +47,14 @@ export class AcpClient {
     void this.read();
     return this.call('initialize', { protocolVersion: 1, clientCapabilities: {
       fs: { readTextFile: false, writeTextFile: false }, terminal: false,
-    }, clientInfo: { name: 'opencode-kiro', version: '0.2.0' } }, 30_000);
+    }, clientInfo: { name: 'opencode-kiro', version: '0.3.0' } }, 30_000);
   }
   send(message: Rpc) { (this.child?.stdin as import('bun').FileSink | undefined)?.write(JSON.stringify(message) + '\n'); }
+  notify(method: string, params: Rpc) { if (this.alive) this.send({ jsonrpc: '2.0', method, params }); }
+  terminate(sessionId: string) {
+    this.listeners.delete(sessionId);
+    if (this.alive) void this.call('_kiro.dev/session/terminate', { sessionId }, 10_000).catch(() => {});
+  }
   call(method: string, params: Rpc, timeout = 180_000): Promise<any> {
     if (this.failure || this.closed) return Promise.reject(this.failure || new Error('Kiro connection closed'));
     const id = ++this.sequence;
@@ -64,7 +75,7 @@ export class AcpClient {
           const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
           if (!line.trim()) continue;
           const msg: Rpc = JSON.parse(line);
-          if (msg.method === 'session/update' || msg.method === '_kiro.dev/metadata') this.onUpdate(msg);
+          if (msg.method === 'session/update' || msg.method === '_kiro.dev/metadata') this.listeners.get(msg.params?.sessionId)?.(msg);
           else if (msg.method && msg.id !== undefined) {
             // Only MCP tools are approved: their execution is relayed to OpenCode.
             if (msg.method === 'session/request_permission') {
@@ -85,7 +96,12 @@ export class AcpClient {
     const diagnostics = await this.diagnostics;
     this.fail(new Error(isAuthError(diagnostics) ? loginInstruction(this.cli) : 'Kiro process exited. Check kiro-cli in a terminal and retry.'));
   }
-  private fail(error: Error) { this.failure = error; for (const item of this.pending.values()) { clearTimeout(item.timer); item.reject(error); } this.pending.clear(); }
+  private fail(error: Error) {
+    if (!this.failure && isAuthError(error.message)) forgetAuthentication();
+    this.failure ??= error;
+    for (const item of this.pending.values()) { clearTimeout(item.timer); item.reject(error); }
+    this.pending.clear();
+  }
   async stop() {
     this.closed = true;
     this.controller.abort();
@@ -94,4 +110,54 @@ export class AcpClient {
     if (this.child) await this.child.exited;
     if (this.directory) await rm(this.directory, { recursive: true, force: true });
   }
+}
+
+// Warm processes keyed by reasoning effort, which Kiro only accepts at launch.
+// A process stops after it has been idle, on authentication failure and on unload.
+export class AcpPool {
+  private entries = new Map<string, { client: AcpClient; ready: Promise<unknown>; users: number; idle?: ReturnType<typeof setTimeout> }>();
+  constructor(private cli = 'kiro-cli', private idleMs = 15 * 60_000) {}
+  async acquire(effort?: string) {
+    const key = effort || '';
+    let entry = this.entries.get(key);
+    if (entry && !entry.client.alive) { this.entries.delete(key); void entry.client.stop(); entry = undefined; }
+    if (!entry) {
+      const client = new AcpClient();
+      entry = { client, ready: client.start(this.cli, effort), users: 0 };
+      this.entries.set(key, entry);
+    }
+    const current = entry;
+    if (current.idle) { clearTimeout(current.idle); current.idle = undefined; }
+    current.users++;
+    try { await current.ready; return current.client; }
+    catch (error) { this.release(current.client); await this.discard(current.client); throw error; }
+  }
+  release(client: AcpClient) {
+    for (const entry of this.entries.values()) {
+      if (entry.client !== client) continue;
+      entry.users = Math.max(0, entry.users - 1);
+      if (entry.users || entry.idle) continue;
+      if (this.idleMs <= 0) void this.discard(client);
+      else entry.idle = setTimeout(() => void this.discard(client), this.idleMs);
+    }
+  }
+  async discard(client: AcpClient) {
+    for (const [key, entry] of this.entries) if (entry.client === client) { if (entry.idle) clearTimeout(entry.idle); this.entries.delete(key); }
+    await client.stop();
+  }
+  // Launch the default process early. Kiro's first session in a process takes
+  // about a second longer than later ones, so open and end one empty session.
+  async prewarm(cwd: string) {
+    try {
+      const client = await this.acquire();
+      try {
+        if (this.warmed.has(client)) return;
+        this.warmed.add(client);
+        const { sessionId } = await client.call('session/new', { cwd, mcpServers: [] });
+        client.terminate(sessionId);
+      } finally { this.release(client); }
+    } catch {}
+  }
+  private warmed = new WeakSet<AcpClient>();
+  async stop() { await Promise.all([...this.entries.values()].map(entry => this.discard(entry.client))); }
 }
