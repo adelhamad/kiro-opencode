@@ -33,6 +33,11 @@ export default Plugin.define({
         });
       });
       await ctx.session.hook('http.request', async event => {
+        // OpenCode may supply a stored Kiro credential instead of this bridge's
+        // ephemeral key. Only attach the key to this plugin's own local bridge.
+        if (new URL(event.request.url).origin === new URL(bridge.url).origin) {
+          event.request.headers.set('authorization', `Bearer ${bridge.secret}`);
+        }
         const session = await ctx.session.get({ sessionID: event.sessionID });
         event.request.headers.set('x-opencode-session', event.sessionID);
         event.request.headers.set('x-opencode-kind', event.kind);
